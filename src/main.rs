@@ -4,6 +4,7 @@ use rust_xlsxwriter::{Color, Format, Workbook};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -147,14 +148,15 @@ fn partial_match(a: &str, b: &str) -> bool {
 // ─── compare & print stats ────────────────────────────────────────────────────
 
 struct Stats {
-    col_a_name:    String,
-    col_b_name:    String,
-    common:        Vec<String>,
-    only_in_a:     Vec<String>,
-    only_in_b:     Vec<String>,
-    values_a:      Vec<Option<String>>,
-    set_b:         HashSet<String>,
-    matched_pairs: Vec<(String, String)>,
+    col_a_name:       String,
+    col_b_name:       String,
+    common:           Vec<String>,
+    only_in_a:        Vec<String>,
+    only_in_b:        Vec<String>,
+    values_a:         Vec<Option<String>>,
+    set_b:            HashSet<String>,
+    matched_pairs:    Vec<(String, String)>,
+    manual_overrides: HashMap<String, String>,
 }
 
 fn compare(
@@ -244,6 +246,45 @@ fn compare(
         values_a: values_a.to_vec(),
         set_b: set_b.into_iter().map(|s| s.to_string()).collect(),
         matched_pairs,
+        manual_overrides: HashMap::new(),
+    }
+}
+
+// ─── manual match ─────────────────────────────────────────────────────────────
+
+fn manual_match(stats: &mut Stats) {
+    if stats.only_in_a.is_empty() {
+        println!("  No unmatched values in '{}'.", stats.col_a_name);
+        return;
+    }
+
+    println!("\n{}", "=".repeat(55));
+    println!("  MANUAL MATCHING — column '{}'", stats.col_a_name);
+    println!("  {} unmatched Basis value(s) to resolve", stats.only_in_a.len());
+    println!("{}", "=".repeat(55));
+
+    let mut sorted_ziel: Vec<&String> = stats.set_b.iter().collect();
+    sorted_ziel.sort();
+
+    for val_a in &stats.only_in_a.clone() {
+        println!("\n  Basis value: \"{}\"", val_a);
+        println!("  Available Ziel values:");
+        for (i, v) in sorted_ziel.iter().enumerate() {
+            println!("    [{i}] {v}");
+        }
+        let choice = prompt("  Select match (index, or blank to skip): ");
+        if choice.is_empty() { continue; }
+        if let Ok(idx) = choice.parse::<usize>() {
+            if idx < sorted_ziel.len() {
+                let val_b = sorted_ziel[idx].to_string();
+                println!("  Mapped: \"{}\" → \"{}\"", val_a, val_b);
+                stats.manual_overrides.insert(val_a.clone(), val_b);
+            } else {
+                println!("  Index out of range, skipped.");
+            }
+        } else {
+            println!("  Invalid input, skipped.");
+        }
     }
 }
 
@@ -312,14 +353,16 @@ fn export_all(
                         val == stripped
                     }).unwrap_or(false);
 
-                    let matched = if is_filename {
+                    let matched: Option<&str> = if is_filename {
                         None
+                    } else if let Some(override_val) = stats.manual_overrides.get(val) {
+                        Some(override_val.as_str())
                     } else {
-                        stats.set_b.iter().find(|b| partial_match(val, b))
+                        stats.set_b.iter().find(|b| partial_match(val, b)).map(|s| s.as_str())
                     };
                     match matched {
                         Some(ziel_val) => {
-                            ws.write_with_format(row_num, col_num, ziel_val.as_str(), &fmt_green).unwrap();
+                            ws.write_with_format(row_num, col_num, ziel_val, &fmt_green).unwrap();
                         }
                         None => {
                             ws.write_with_format(row_num, col_num, val, &fmt_red).unwrap();
@@ -332,8 +375,26 @@ fn export_all(
         }
     }
 
-    let out = "comparison_results.xlsx";
-    wb.save(out).unwrap();
+    let ts = {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (s, m, h) = (secs % 60, (secs / 60) % 60, (secs / 3600) % 24);
+        let days = secs / 86400 + 719468;
+        let era = if days >= 0 { days } else { days - 146096 } / 146097;
+        let doe = days - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if mo <= 2 { y + 1 } else { y };
+        format!("{y:04}{mo:02}{d:02}_{h:02}{m:02}{s:02}")
+    };
+    let out = format!("comparison_results_v{}_{ts}.xlsx", env!("CARGO_PKG_VERSION"));
+    wb.save(&out).unwrap();
     println!("  Saved → {out}");
 }
 
@@ -395,6 +456,13 @@ fn main() {
         );
 
         all_stats.push((stats, col_a_idx));
+    }
+
+    let do_manual = prompt("\nManually assign Ziel values for unmatched Basis entries? (y/n): ");
+    if do_manual.eq_ignore_ascii_case("y") {
+        for (stats, _) in &mut all_stats {
+            manual_match(stats);
+        }
     }
 
     let choice = prompt("\nExport all results to Excel? (y/n): ");
